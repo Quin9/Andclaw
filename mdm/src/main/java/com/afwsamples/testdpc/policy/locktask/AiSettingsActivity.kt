@@ -284,7 +284,8 @@ class AiSettingsActivity : AppCompatActivity() {
             val body = JSONObject().apply {
                 put("model", model)
                 put("max_tokens", 64)
-                if (!model.contains("k2.5")) {
+                // Kimi K2 models only allow the service-defined temperature.
+                if (!model.contains("k2", ignoreCase = true)) {
                     put("temperature", 0.0)
                 }
                 put("messages", JSONArray().apply {
@@ -339,7 +340,8 @@ class AiSettingsActivity : AppCompatActivity() {
             val body = JSONObject().apply {
                 put("model", model)
                 put("max_tokens", 64)
-                if (!model.contains("k2.5")) {
+                // Kimi K2 models only allow the service-defined temperature.
+                if (!model.contains("k2", ignoreCase = true)) {
                     put("temperature", 0.0)
                 }
                 put("messages", JSONArray().apply {

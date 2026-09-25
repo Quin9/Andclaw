@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
@@ -14,6 +15,9 @@ import com.demo.model.KimiApiClient
 import com.demo.model.KimiMessage
 import com.google.gson.Gson
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -29,6 +33,11 @@ import java.util.concurrent.TimeUnit
 object Utils {
     private const val TAG = "AgentLLM"
     private const val MAX_HTTP_RESPONSE_CHARS = 48_000
+    private const val MOONSHOT_MIN_REQUEST_INTERVAL_MS = 21_000L
+    private const val MAX_RATE_LIMIT_RETRIES = 4
+
+    private val moonshotRequestMutex = Mutex()
+    private var lastMoonshotRequestAtMs = 0L
 
     private val httpAgentClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -37,8 +46,8 @@ object Utils {
         .build()
 
     /**
-     * Agent 「http_request」动作：发起 HTTP/HTTPS 请求。
-     * 返回 [Pair.first]=true 表示已收到 HTTP 响应（含 4xx/5xx）；仅连接/IO 失败时为 false。
+     * Agent `http_request` 动作：发起 HTTP/HTTPS 请求。
+     * 返回 [Pair.first]=true 表示已收到 HTTP 响应（含 4xx/5xx）；仅连接或 IO 失败时为 false。
      */
     suspend fun executeHttpRequest(action: AiAction): Pair<Boolean, String> = withContext(Dispatchers.IO) {
         val urlString = action.data?.trim().orEmpty()
@@ -333,7 +342,7 @@ CRITICAL: Your entire response must be parseable as JSON. Any non-JSON text will
                 .connectTimeout(30, TimeUnit.SECONDS)
                 .build()
 
-            // 统一转换为 OpenAI 兼容格式 (Gemini 1.5 现已支持 OpenAI 格式)
+            // 统一转换为 OpenAI 兼容格式（Gemini 1.5 现已支持 OpenAI 格式）
             val requestBody = JSONObject().apply {
                 put("model", config.model)
                 put("messages", JSONArray().apply {
@@ -342,8 +351,9 @@ CRITICAL: Your entire response must be parseable as JSON. Any non-JSON text will
                         put("content", prompt)
                     })
                 })
-                if (!config.model.contains("k2.5")) {
-                    put("temperature", 0.1)
+                // Kimi K2 models use a fixed temperature and reject custom values.
+                if (!config.model.contains("k2", ignoreCase = true)) {
+                    put("temperature", 1)
                 }
             }
 
@@ -353,17 +363,15 @@ CRITICAL: Your entire response must be parseable as JSON. Any non-JSON text will
                 .header("Authorization", "Bearer ${config.apiKey}")
                 .build()
 
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) throw Exception("API Error: ${response.code}")
-                val body = response.body.string()
+            val (responseCode, body) = executeLlmRequestWithRetry(client, request)
+            if (responseCode !in 200..299) throw Exception("API Error: $responseCode")
 
-                // 解析内容
-                val jsonResponse = JSONObject(body)
-                jsonResponse.getJSONArray("choices")
-                    .getJSONObject(0)
-                    .getJSONObject("message")
-                    .getString("content")
-            }
+            // 解析内容
+            val jsonResponse = JSONObject(body)
+            jsonResponse.getJSONArray("choices")
+                .getJSONObject(0)
+                .getJSONObject("message")
+                .getString("content")
         }
 
     fun parseAction(rawResponse: String): AiAction {
@@ -390,7 +398,7 @@ CRITICAL: Your entire response must be parseable as JSON. Any non-JSON text will
 
             var cleanJson = jsonContent.trim()
 
-            // 若 AI 返回数组格式，取第一个元素
+            // If the AI returns an array, use its first element.
             if (cleanJson.startsWith("[{")) {
                 cleanJson = JSONArray(cleanJson).getJSONObject(0).toString()
             }
@@ -519,8 +527,9 @@ Respond with JSON only."""
                         put("content", userContent)
                     })
                 })
-                if (!config.model.contains("k2.5")) {
-                    put("temperature", 0.0)
+                // Kimi K2 models use a fixed temperature and reject custom values.
+                if (!config.model.contains("k2", ignoreCase = true)) {
+                    put("temperature", 1)
                 }
                 if (screenshotBase64 == null) {
                     put("response_format", JSONObject().put("type", "json_object"))
@@ -535,19 +544,17 @@ Respond with JSON only."""
                 .header("Authorization", "Bearer ${config.apiKey}")
                 .build()
 
-            client.newCall(request).execute().use { response ->
-                val responseString = response.body.string()
-                if (!response.isSuccessful) {
-                    Log.e(TAG, "OpenAI API Error ${response.code}: $responseString")
-                    return@withContext errorJsonStub("API Error ${response.code}")
-                }
-
-                return@withContext JSONObject(responseString)
-                    .getJSONArray("choices")
-                    .getJSONObject(0)
-                    .getJSONObject("message")
-                    .getString("content")
+            val (responseCode, responseString) = executeLlmRequestWithRetry(client, request)
+            if (responseCode !in 200..299) {
+                Log.e(TAG, "OpenAI API Error $responseCode: $responseString")
+                return@withContext errorJsonStub("API Error $responseCode")
             }
+
+            return@withContext JSONObject(responseString)
+                .getJSONArray("choices")
+                .getJSONObject(0)
+                .getJSONObject("message")
+                .getString("content")
         } catch (e: SocketTimeoutException) {
             e.printStackTrace()
             showToastOnMain(context, "Network Timeout. Check your API server.")
@@ -565,7 +572,56 @@ Respond with JSON only."""
     }
 
     /**
-     * 辅助函数：安全地在主线程弹出 Toast
+     * Executes an LLM request with Moonshot pacing and automatic HTTP 429 retry.
+     * The current Moonshot account is limited to roughly three requests per minute,
+     * so requests to its official host are spaced out before they are sent.
+     */
+    private suspend fun executeLlmRequestWithRetry(
+        client: OkHttpClient,
+        request: Request
+    ): Pair<Int, String> {
+        var attempt = 0
+        while (true) {
+            awaitMoonshotRequestSlot(request)
+
+            var retryAfterMs = 0L
+            val result = client.newCall(request).execute().use { response ->
+                retryAfterMs = response.header("Retry-After")
+                    ?.trim()
+                    ?.toLongOrNull()
+                    ?.times(1_000L)
+                    ?: 0L
+                response.code to response.body.string()
+            }
+
+            if (result.first != 429 || attempt >= MAX_RATE_LIMIT_RETRIES) {
+                return result
+            }
+
+            val exponentialBackoffMs = minOf(5_000L * (1L shl attempt), 40_000L)
+            val waitMs = maxOf(retryAfterMs, exponentialBackoffMs)
+            Log.w(TAG, "HTTP 429 rate limited; retrying in ${waitMs / 1_000}s (attempt ${attempt + 1}/$MAX_RATE_LIMIT_RETRIES)")
+            delay(waitMs)
+            attempt++
+        }
+    }
+
+    private suspend fun awaitMoonshotRequestSlot(request: Request) {
+        if (!request.url.host.equals("api.moonshot.cn", ignoreCase = true)) return
+
+        moonshotRequestMutex.withLock {
+            val now = SystemClock.elapsedRealtime()
+            val waitMs = MOONSHOT_MIN_REQUEST_INTERVAL_MS - (now - lastMoonshotRequestAtMs)
+            if (waitMs > 0) {
+                Log.d(TAG, "Moonshot rate limit pacing: waiting ${waitMs / 1_000}s")
+                delay(waitMs)
+            }
+            lastMoonshotRequestAtMs = SystemClock.elapsedRealtime()
+        }
+    }
+
+    /**
+     * 辅助函数：安全地在主线程弹出 Toast。
      */
     private fun showToastOnMain(context: Context, message: String) {
         Handler(Looper.getMainLooper()).post {

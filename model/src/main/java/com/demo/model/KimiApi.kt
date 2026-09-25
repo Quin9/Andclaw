@@ -42,7 +42,7 @@ object KimiApiClient {
      * @param baseUrl 基础地址，默认 https://api.kimi.com/coding
      * @param model 模型 ID
      * @param maxTokens 最大输出 token 数
-     * @param temperature 采样温度
+     * @param temperature 可选采样温度；null 时不发送，由服务端决定
      * @return 模型回复的文本内容
      */
     suspend fun chat(
@@ -52,14 +52,14 @@ object KimiApiClient {
         baseUrl: String = "https://api.kimi.com/coding",
         model: String = "kimi-k2.5",
         maxTokens: Int = 8192,
-        temperature: Double = 0.0
+        temperature: Double? = null
     ): String = withContext(Dispatchers.IO) {
         val url = "${baseUrl.removeSuffix("/")}/v1/messages"
 
         val body = JSONObject().apply {
             put("model", model)
             put("max_tokens", maxTokens)
-            put("temperature", temperature)
+            temperature?.let { put("temperature", it) }
             if (!system.isNullOrEmpty()) {
                 put("system", system)
             }
